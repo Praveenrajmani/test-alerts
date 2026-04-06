@@ -1,0 +1,185 @@
+x-minio-common: &minio-common
+  image: ${MINIO_IMAGE}
+  command: server http://minio{1...4}/data{1...2} --console-address ":9001"
+  expose:
+    - "9000"
+    - "9001"
+  environment:
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    MINIO_LICENSE: ${MINIO_LICENSE}
+    # KES / KMS configuration - MinIO uses mTLS to talk to KES
+    MINIO_KMS_KES_ENDPOINT: "https://kes:7373"
+    MINIO_KMS_KES_KEY_NAME: "minio-key"
+    MINIO_KMS_KES_KEY_FILE: "/kes-certs/minio-kes-client.key"
+    MINIO_KMS_KES_CERT_FILE: "/kes-certs/minio-kes-client.crt"
+    MINIO_KMS_KES_CAPATH: "/kes-certs/ca.crt"
+    # Alert -> Webhook
+    MINIO_ALERT_WEBHOOK_ENABLE: "on"
+    MINIO_ALERT_WEBHOOK_ENDPOINT: "http://webhook:9090/alerts"
+    # Alert -> Kafka
+    MINIO_ALERT_KAFKA_ENABLE: "on"
+    MINIO_ALERT_KAFKA_BROKERS: "kafka:29092"
+    MINIO_ALERT_KAFKA_TOPIC: "alert-events"
+    # Subnet (optional, from .env)
+    _MINIO_SUBNET_URL: ${_MINIO_SUBNET_URL:-}
+    MINIO_CALLHOME_ENABLE: ${MINIO_CALLHOME_ENABLE:-off}
+  depends_on:
+    # KES must be started (not necessarily healthy) before MinIO so that
+    # KES is reachable by the time the first KMS alert monitor check runs.
+    # KES starts in ~2s; MinIO cluster init takes ~30s, so KES is always
+    # ready before the alert monitor's first check.
+    kes:
+      condition: service_started
+    kafka:
+      condition: service_healthy
+    webhook:
+      condition: service_healthy
+    init-kafka:
+      condition: service_completed_successfully
+  healthcheck:
+    test: curl -sf http://localhost:9000/minio/health/live || exit 1
+    interval: 5s
+    timeout: 5s
+    retries: 30
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ./certs:/kes-certs:ro
+  networks:
+    - test-net
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: kafka-kms
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: MkU3OEVBNTcwNTJFNDM2Qk
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server localhost:29092
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    networks:
+      - test-net
+
+  init-kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: init-kafka-kms
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      kafka-topics --bootstrap-server kafka:29092 --create --topic alert-events --partitions 3 --replication-factor 1 --if-not-exists &&
+      echo 'Kafka topic created: alert-events'
+      "
+    networks:
+      - test-net
+
+  webhook:
+    build: ../webhook-receiver
+    hostname: webhook
+    container_name: webhook-kms
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: curl -sf http://localhost:9090/health || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - test-net
+
+  # MinIO KES (Key Encryption Service) - the external KMS backend.
+  # After the MinIO cluster is healthy, this container is stopped by run.sh
+  # to simulate KMS unavailability and trigger the kms-unavailable alert.
+  kes:
+    image: minio/kes:latest
+    hostname: kes
+    container_name: kes-kms
+    command: server --config /config/kes-config.yaml
+    ports:
+      - "7373:7373"
+    volumes:
+      - ./certs:/certs:ro
+      - ./config:/config:ro
+    tmpfs:
+      - /data   # writable storage for the fs keystore (keys are ephemeral)
+    # No docker healthcheck: KES requires mTLS client certs which are not
+    # available inside the container for self-checks. run.sh waits for the
+    # port to respond from the host before proceeding.
+    networks:
+      - test-net
+
+  # MinIO cluster (4 nodes, 2 drives each - no MinIO TLS, KES mTLS handled separately)
+  minio1:
+    <<: *minio-common
+    hostname: minio1
+    container_name: minio1-kms
+    tmpfs:
+      - /data1
+      - /data2
+
+  minio2:
+    <<: *minio-common
+    hostname: minio2
+    container_name: minio2-kms
+    tmpfs:
+      - /data1
+      - /data2
+
+  minio3:
+    <<: *minio-common
+    hostname: minio3
+    container_name: minio3-kms
+    tmpfs:
+      - /data1
+      - /data2
+
+  minio4:
+    <<: *minio-common
+    hostname: minio4
+    container_name: minio4-kms
+    tmpfs:
+      - /data1
+      - /data2
+
+  nginx:
+    image: nginx:alpine
+    hostname: nginx
+    container_name: nginx-kms
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      minio1:
+        condition: service_healthy
+      minio2:
+        condition: service_healthy
+      minio3:
+        condition: service_healthy
+      minio4:
+        condition: service_healthy
+    networks:
+      - test-net
+
+networks:
+  test-net:
+    driver: bridge

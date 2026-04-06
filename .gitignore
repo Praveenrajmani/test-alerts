@@ -1,2 +1,5 @@
 .env
+*/.env
 certs/
+*/docker-compose.override.yaml
+
