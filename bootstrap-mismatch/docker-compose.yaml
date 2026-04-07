@@ -1,0 +1,261 @@
+# Bootstrap configuration mismatch alert test.
+#
+# Scenario: minio4 is started with MINIO_SITE_NAME=wrong-site while the other
+# three nodes use MINIO_SITE_NAME=prod-cluster. During bootstrap verification,
+# nodes 1/2/3 detect the env-var mismatch on minio4 and record it. Once the
+# healthy majority (nodes 1-3) reaches quorum, minio1 (FirstLocal) sends a
+# config-mismatch alert for minio4.
+#
+# minio4 stays stuck in verifyServerSystemConfig forever because it cannot
+# reach quorum — every peer disagrees with its MINIO_SITE_NAME value.
+# nginx deliberately excludes minio4; only minio1-3 serve traffic.
+#
+# NOTE: Do NOT set CI=true or MINIO_CI_CD=true — those env vars disable
+# bootstrap verification and would prevent the mismatch from being detected.
+
+x-minio-base: &minio-base
+  image: ${MINIO_IMAGE}
+  command: server http://minio{1...4}/data{1...2} --console-address ":9001"
+  expose:
+    - "9000"
+    - "9001"
+  environment:
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    MINIO_LICENSE: ${MINIO_LICENSE}
+    # Alert -> Webhook
+    MINIO_ALERT_WEBHOOK_ENABLE: "on"
+    MINIO_ALERT_WEBHOOK_ENDPOINT: "http://webhook:9090/alerts"
+    # Alert -> Kafka
+    MINIO_ALERT_KAFKA_ENABLE: "on"
+    MINIO_ALERT_KAFKA_BROKERS: "kafka:29092"
+    MINIO_ALERT_KAFKA_TOPIC: "alert-events"
+    _MINIO_SUBNET_URL: ${_MINIO_SUBNET_URL:-}
+    MINIO_CALLHOME_ENABLE: ${MINIO_CALLHOME_ENABLE:-off}
+  depends_on:
+    kafka:
+      condition: service_healthy
+    webhook:
+      condition: service_healthy
+    init-kafka:
+      condition: service_completed_successfully
+  healthcheck:
+    test: curl -sf http://localhost:9000/minio/health/live || exit 1
+    interval: 5s
+    timeout: 5s
+    retries: 30
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  tmpfs:
+    - /data1
+    - /data2
+  networks:
+    - test-net
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: kafka-mismatch
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: MkU3OEVBNTcwNTJFNDM2Qk
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server localhost:29092
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    networks:
+      - test-net
+
+  init-kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: init-kafka-mismatch
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      kafka-topics --bootstrap-server kafka:29092 --create --topic alert-events --partitions 3 --replication-factor 1 --if-not-exists &&
+      echo 'Kafka topic created: alert-events'
+      "
+    networks:
+      - test-net
+
+  webhook:
+    build: ../webhook-receiver
+    hostname: webhook
+    container_name: webhook-mismatch
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: curl -sf http://localhost:9090/health || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - test-net
+
+  # --- Misconfigured minority node (node 4) ---
+  # minio4 starts BEFORE minio1-3 (they depend on it via service_healthy).
+  # This guarantees minio4's HTTP server is accepting connections when minio1
+  # first attempts its grid connection to minio4.
+  #
+  # Why service_healthy (not service_started):
+  # The grid reconnect backoff is 2-4 s (defaultDialTimeout). If the first
+  # connection attempt to minio4 gets "connection refused", the next retry is
+  # 2-4 s later — well after verifyServerSystemConfig has already exited with
+  # an empty configMismatches (quorum reached from minio1+minio2+minio3).
+  # We must ensure minio4's HTTP listener is up before minio1 starts.
+  #
+  # /minio/health/live returns 200 OK even during bootstrap verification
+  # (LivenessCheckHandler sets the MinIOServerStatus:offline header but does
+  # not return early — it falls through to a 200 response). The standard
+  # healthcheck therefore passes as soon as minio4's HTTP server accepts
+  # connections, which happens before verifyServerSystemConfig blocks.
+  #
+  # minio4 stays stuck in verifyServerSystemConfig forever (it disagrees with
+  # all peers). This is intentional.
+  minio4:
+    <<: *minio-base
+    hostname: minio4
+    container_name: minio4-mismatch
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_LICENSE: ${MINIO_LICENSE}
+      # Intentionally different: triggers ErrEnvMismatch for MINIO_SITE_NAME
+      MINIO_SITE_NAME: "wrong-site"
+      MINIO_ALERT_WEBHOOK_ENABLE: "on"
+      MINIO_ALERT_WEBHOOK_ENDPOINT: "http://webhook:9090/alerts"
+      MINIO_ALERT_KAFKA_ENABLE: "on"
+      MINIO_ALERT_KAFKA_BROKERS: "kafka:29092"
+      MINIO_ALERT_KAFKA_TOPIC: "alert-events"
+      _MINIO_SUBNET_URL: ${_MINIO_SUBNET_URL:-}
+      MINIO_CALLHOME_ENABLE: ${MINIO_CALLHOME_ENABLE:-off}
+
+  # --- Correctly-configured majority (nodes 1-3) ---
+  # All three nodes share MINIO_SITE_NAME=prod-cluster and agree during
+  # bootstrap verification. They form the quorum and start up successfully.
+  #
+  # depends_on uses minio4: service_healthy to guarantee minio4's HTTP
+  # listener is up before minio1-3 start. This ensures minio1's first grid
+  # connection attempt to minio4 succeeds and the connection reaches
+  # StateConnected before verifyServerSystemConfig runs.
+  # If the first attempt were refused, the 2-4 s reconnect backoff would cause
+  # minio4 to still be StateConnectionError when quorum is reached from
+  # minio2+minio3, leaving configMismatches empty and suppressing the alert.
+  minio1:
+    <<: *minio-base
+    hostname: minio1
+    container_name: minio1-mismatch
+    depends_on:
+      kafka:
+        condition: service_healthy
+      webhook:
+        condition: service_healthy
+      init-kafka:
+        condition: service_completed_successfully
+      minio4:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_LICENSE: ${MINIO_LICENSE}
+      MINIO_SITE_NAME: "prod-cluster"
+      MINIO_ALERT_WEBHOOK_ENABLE: "on"
+      MINIO_ALERT_WEBHOOK_ENDPOINT: "http://webhook:9090/alerts"
+      MINIO_ALERT_KAFKA_ENABLE: "on"
+      MINIO_ALERT_KAFKA_BROKERS: "kafka:29092"
+      MINIO_ALERT_KAFKA_TOPIC: "alert-events"
+      _MINIO_SUBNET_URL: ${_MINIO_SUBNET_URL:-}
+      MINIO_CALLHOME_ENABLE: ${MINIO_CALLHOME_ENABLE:-off}
+
+  minio2:
+    <<: *minio-base
+    hostname: minio2
+    container_name: minio2-mismatch
+    depends_on:
+      kafka:
+        condition: service_healthy
+      webhook:
+        condition: service_healthy
+      init-kafka:
+        condition: service_completed_successfully
+      minio4:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_LICENSE: ${MINIO_LICENSE}
+      MINIO_SITE_NAME: "prod-cluster"
+      MINIO_ALERT_WEBHOOK_ENABLE: "on"
+      MINIO_ALERT_WEBHOOK_ENDPOINT: "http://webhook:9090/alerts"
+      MINIO_ALERT_KAFKA_ENABLE: "on"
+      MINIO_ALERT_KAFKA_BROKERS: "kafka:29092"
+      MINIO_ALERT_KAFKA_TOPIC: "alert-events"
+      _MINIO_SUBNET_URL: ${_MINIO_SUBNET_URL:-}
+      MINIO_CALLHOME_ENABLE: ${MINIO_CALLHOME_ENABLE:-off}
+
+  minio3:
+    <<: *minio-base
+    hostname: minio3
+    container_name: minio3-mismatch
+    depends_on:
+      kafka:
+        condition: service_healthy
+      webhook:
+        condition: service_healthy
+      init-kafka:
+        condition: service_completed_successfully
+      minio4:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_LICENSE: ${MINIO_LICENSE}
+      MINIO_SITE_NAME: "prod-cluster"
+      MINIO_ALERT_WEBHOOK_ENABLE: "on"
+      MINIO_ALERT_WEBHOOK_ENDPOINT: "http://webhook:9090/alerts"
+      MINIO_ALERT_KAFKA_ENABLE: "on"
+      MINIO_ALERT_KAFKA_BROKERS: "kafka:29092"
+      MINIO_ALERT_KAFKA_TOPIC: "alert-events"
+      _MINIO_SUBNET_URL: ${_MINIO_SUBNET_URL:-}
+      MINIO_CALLHOME_ENABLE: ${MINIO_CALLHOME_ENABLE:-off}
+
+  # Nginx forwards traffic only to the healthy majority (minio1-3).
+  # minio4 is excluded because it never completes startup.
+  nginx:
+    image: nginx:alpine
+    hostname: nginx
+    container_name: nginx-mismatch
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      minio1:
+        condition: service_healthy
+      minio2:
+        condition: service_healthy
+      minio3:
+        condition: service_healthy
+    networks:
+      - test-net
+
+networks:
+  test-net:
+    driver: bridge
