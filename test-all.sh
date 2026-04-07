@@ -7,6 +7,7 @@
 #   3. Storage capacity critical   (storage-capacity/)   — storage-capacity
 #   4. Bootstrap config mismatch   (bootstrap-mismatch/) — config-mismatch (env, endpoints, args)
 #   5. Erasure set health          (erasure-set-health/) — erasure-set-health
+#   6. Scanner excess              (scanner-excess/)     — scanner-excess-folders, scanner-excess-versions
 #
 # Each scenario is run in isolation: `docker compose down` is called before
 # and after each run to guarantee clean state.
@@ -18,6 +19,7 @@
 #   ./test-all.sh storage          # run only storage capacity
 #   ./test-all.sh mismatch         # run only bootstrap mismatch (all 3 sub-types)
 #   ./test-all.sh erasure          # run only erasure set health
+#   ./test-all.sh scanner          # run only scanner excess
 #
 # Prerequisites: Docker, docker compose v2, curl, python3.
 
@@ -117,18 +119,11 @@ run_cert() {
 
     if bash run.sh "$mode"; then
         echo ""
-        # generate test objects/events to trigger the alert check
-        if bash generate.sh; then
-            echo ""
-            if bash verify.sh; then
-                ok "$label — PASSED"
-                record_pass "$label"
-            else
-                err "$label — FAILED (verify.sh returned non-zero)"
-                record_fail "$label"
-            fi
+        if bash verify.sh; then
+            ok "$label — PASSED"
+            record_pass "$label"
         else
-            err "$label — FAILED (generate.sh returned non-zero)"
+            err "$label — FAILED (verify.sh returned non-zero)"
             record_fail "$label"
         fi
     else
@@ -168,15 +163,19 @@ case "$FILTER" in
     erasure)
         run_scenario "Erasure Set Health" "$SCRIPT_DIR/erasure-set-health"
         ;;
+    scanner)
+        run_scenario "Scanner Excess" "$SCRIPT_DIR/scanner-excess"
+        ;;
     all)
         run_cert expiring
         run_scenario "KMS Unavailability"         "$SCRIPT_DIR/kms-unavailability"
         run_scenario "Storage Capacity Critical"  "$SCRIPT_DIR/storage-capacity"
         run_mismatch
         run_scenario "Erasure Set Health"         "$SCRIPT_DIR/erasure-set-health"
+        run_scenario "Scanner Excess"             "$SCRIPT_DIR/scanner-excess"
         ;;
     *)
-        echo "Usage: $0 [cert|kms|storage|mismatch|erasure|all]"
+        echo "Usage: $0 [cert|kms|storage|mismatch|erasure|scanner|all]"
         exit 1
         ;;
 esac
