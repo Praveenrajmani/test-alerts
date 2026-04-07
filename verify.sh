@@ -69,4 +69,10 @@ docker exec kafka kafka-console-consumer \
     --timeout-ms 3000 2>/dev/null | tail -1 | python3 -m json.tool 2>/dev/null | head -30 || echo "  (unavailable)"
 
 echo ""
+
+# shellcheck source=verify-mc.sh
+source "$(dirname "$0")/verify-mc.sh"
+check_mc_alerts "certificate-expiry" "https://localhost:9010" "--insecure"
+
+echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

@@ -1,0 +1,154 @@
+# Erasure set health alert test.
+#
+# Scenario: a 4-node MinIO cluster (2 drives per node, EC:4 on 8 drives).
+# All four nodes start and reach a healthy state so that the leader's
+# first immediate check runs with full drive availability. run.sh then
+# stops minio4 to simulate a 2-drive failure, waits for the remaining
+# nodes to detect the outage, and restarts minio1 to force a leader
+# re-election. The new leader's immediate checkAndAlertErasureSetHealth
+# fires a degradation alert (condition depends on timing: two_from_quorum_loss
+# if minio1 has recovered by then; write_unavailable if the check runs while
+# minio1 is still restarting).
+#
+# nginx routes traffic to minio1-3 only (minio4 is stopped after setup).
+
+x-minio-common: &minio-common
+  image: ${MINIO_IMAGE}
+  command: server http://minio{1...4}/data{1...2} --console-address ":9001"
+  expose:
+    - "9000"
+    - "9001"
+  environment:
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    MINIO_LICENSE: ${MINIO_LICENSE}
+    # Alert -> Webhook
+    MINIO_ALERT_WEBHOOK_ENABLE: "on"
+    MINIO_ALERT_WEBHOOK_ENDPOINT: "http://webhook:9090/alerts"
+    # Alert -> Kafka
+    MINIO_ALERT_KAFKA_ENABLE: "on"
+    MINIO_ALERT_KAFKA_BROKERS: "kafka:29092"
+    MINIO_ALERT_KAFKA_TOPIC: "alert-events"
+    _MINIO_SUBNET_URL: ${_MINIO_SUBNET_URL:-}
+    MINIO_CALLHOME_ENABLE: ${MINIO_CALLHOME_ENABLE:-off}
+  depends_on:
+    kafka:
+      condition: service_healthy
+    webhook:
+      condition: service_healthy
+    init-kafka:
+      condition: service_completed_successfully
+  healthcheck:
+    test: curl -sf http://localhost:9000/minio/health/live || exit 1
+    interval: 5s
+    timeout: 5s
+    retries: 30
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  tmpfs:
+    - /data1
+    - /data2
+  networks:
+    - test-net
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: kafka-erasure
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: MkU3OEVBNTcwNTJFNDM2Qk
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server localhost:29092
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    networks:
+      - test-net
+
+  init-kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: init-kafka-erasure
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      kafka-topics --bootstrap-server kafka:29092 --create --topic alert-events --partitions 3 --replication-factor 1 --if-not-exists &&
+      echo 'Kafka topic created: alert-events'
+      "
+    networks:
+      - test-net
+
+  webhook:
+    build: ../webhook-receiver
+    hostname: webhook
+    container_name: webhook-erasure
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: curl -sf http://localhost:9090/health || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - test-net
+
+  minio1:
+    <<: *minio-common
+    hostname: minio1
+    container_name: minio1-erasure
+
+  minio2:
+    <<: *minio-common
+    hostname: minio2
+    container_name: minio2-erasure
+
+  minio3:
+    <<: *minio-common
+    hostname: minio3
+    container_name: minio3-erasure
+
+  minio4:
+    <<: *minio-common
+    hostname: minio4
+    container_name: minio4-erasure
+
+  # Routes only to minio1-3; minio4 is stopped after cluster reaches healthy state.
+  nginx:
+    image: nginx:alpine
+    hostname: nginx
+    container_name: nginx-erasure
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      minio1:
+        condition: service_healthy
+      minio2:
+        condition: service_healthy
+      minio3:
+        condition: service_healthy
+      minio4:
+        condition: service_healthy
+    networks:
+      - test-net
+
+networks:
+  test-net:
+    driver: bridge

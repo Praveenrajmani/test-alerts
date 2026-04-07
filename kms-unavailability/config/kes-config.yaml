@@ -9,7 +9,7 @@ tls:
 admin:
   # Dedicated admin identity — distinct from the MinIO policy identity.
   # KES rejects configs where the same identity appears in both admin and a policy.
-  identity: 6da24981a96568bc90e976abd2bebbdd5d0ce25761fd106f2e1dc72b1bc9ab15
+  identity: b821fcde0ad1c4a64b67a7ff5756a8baf984b029e40872a69fcc2af44abb2eac
 
 policy:
   minio:
@@ -22,7 +22,7 @@ policy:
       - /v1/status
       - /v1/metrics
     identities:
-      - 3a32edbc0c614c1595e9e42dfda1ff00e82084f9f1053f5621014b32fd15a00c
+      - 025f8e75ce1bdbe99fa3b1225c31e43357a7f7aa487a00ba0bfd20a0d449f4c9
 
 keystore:
   fs:

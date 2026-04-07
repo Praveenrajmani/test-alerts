@@ -216,5 +216,11 @@ else
 fi
 
 echo ""
+
+# shellcheck source=../verify-mc.sh
+source "$(dirname "$0")/../verify-mc.sh"
+check_mc_alerts "$ALERT_TYPE" "http://localhost:9010"
+
+echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1
