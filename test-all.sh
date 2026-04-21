@@ -8,6 +8,7 @@
 #   4. Bootstrap config mismatch   (bootstrap-mismatch/) — config-mismatch (env, endpoints, args)
 #   5. Erasure set health          (erasure-set-health/) — erasure-set-health
 #   6. Scanner excess              (scanner-excess/)     — scanner-excess-folders, scanner-excess-versions
+#   7. License expiry              (license-expiry/)     — license-expiry
 #
 # Each scenario is run in isolation: `docker compose down` is called before
 # and after each run to guarantee clean state.
@@ -20,6 +21,7 @@
 #   ./test-all.sh mismatch         # run only bootstrap mismatch (all 3 sub-types)
 #   ./test-all.sh erasure          # run only erasure set health
 #   ./test-all.sh scanner          # run only scanner excess
+#   ./test-all.sh license          # run only license expiry (requires MINIO_EXPIRED_LICENSE)
 #
 # Prerequisites: Docker, docker compose v2, curl, python3.
 
@@ -50,10 +52,31 @@ if [ -z "${MINIO_IMAGE:-}" ]; then
     echo "Error: MINIO_IMAGE is not set. Edit .env and set MINIO_IMAGE."
     exit 1
 fi
-if [ -z "${MINIO_LICENSE:-}" ]; then
+
+# MINIO_LICENSE is required for every scenario except license-expiry, which
+# uses MINIO_EXPIRED_LICENSE instead.
+if [ "$FILTER" != "license" ] && [ -z "${MINIO_LICENSE:-}" ]; then
     echo "Error: MINIO_LICENSE is not set. Edit .env and set MINIO_LICENSE."
     exit 1
 fi
+
+# MINIO_EXPIRED_LICENSE is required for the license-expiry scenario.
+if [ "$FILTER" = "license" ] || [ "$FILTER" = "all" ]; then
+    if [ -z "${MINIO_EXPIRED_LICENSE:-}" ]; then
+        echo "Error: MINIO_EXPIRED_LICENSE is not set."
+        echo ""
+        echo "  The license-expiry scenario requires a fully-expired MinIO AIStor"
+        echo "  license. Set MINIO_EXPIRED_LICENSE in .env."
+        if [ "$FILTER" = "all" ]; then
+            echo ""
+            echo "  Skipping license-expiry scenario and continuing with others."
+            SKIP_LICENSE=true
+        else
+            exit 1
+        fi
+    fi
+fi
+SKIP_LICENSE="${SKIP_LICENSE:-false}"
 
 echo "================================================"
 echo " MinIO AIStor Alert Scenarios — End-to-End Test"
@@ -136,6 +159,15 @@ run_cert() {
     cd "$SCRIPT_DIR"
 }
 
+# ── scenario 7: license expiry ────────────────────────────────────────────────
+run_license() {
+    if $SKIP_LICENSE; then
+        info "Skipping License Expiry (MINIO_EXPIRED_LICENSE not set)"
+        return
+    fi
+    run_scenario "License Expiry" "$SCRIPT_DIR/license-expiry"
+}
+
 # ── scenario 4: bootstrap mismatch (three sub-types) ─────────────────────────
 run_mismatch() {
     for mtype in env endpoints args; do
@@ -166,6 +198,9 @@ case "$FILTER" in
     scanner)
         run_scenario "Scanner Excess" "$SCRIPT_DIR/scanner-excess"
         ;;
+    license)
+        run_license
+        ;;
     all)
         run_cert expiring
         run_scenario "KMS Unavailability"         "$SCRIPT_DIR/kms-unavailability"
@@ -173,9 +208,10 @@ case "$FILTER" in
         run_mismatch
         run_scenario "Erasure Set Health"         "$SCRIPT_DIR/erasure-set-health"
         run_scenario "Scanner Excess"             "$SCRIPT_DIR/scanner-excess"
+        run_license
         ;;
     *)
-        echo "Usage: $0 [cert|kms|storage|mismatch|erasure|scanner|all]"
+        echo "Usage: $0 [cert|kms|storage|mismatch|erasure|scanner|license|all]"
         exit 1
         ;;
 esac
