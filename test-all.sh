@@ -20,13 +20,22 @@
 #   ./test-all.sh mismatch         # run only bootstrap mismatch (all 3 sub-types)
 #   ./test-all.sh erasure          # run only erasure set health
 #   ./test-all.sh scanner          # run only scanner excess
+#   ./test-all.sh cert --keep      # leave containers running after test (inspect disks)
 #
 # Prerequisites: Docker, docker compose v2, curl, python3.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FILTER="${1:-all}"
+
+FILTER="all"
+KEEP=false
+for arg in "$@"; do
+    case "$arg" in
+        --keep) KEEP=true ;;
+        *)      FILTER="$arg" ;;
+    esac
+done
 
 # ── colour helpers ────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -98,7 +107,11 @@ run_scenario() {
     fi
 
     echo ""
-    docker compose down --volumes --remove-orphans 2>/dev/null || true
+    if $KEEP; then
+        info "Containers left running (--keep). Use ./remove-all.sh or 'docker compose down' to clean up."
+    else
+        docker compose down --volumes --remove-orphans 2>/dev/null || true
+    fi
     cd "$SCRIPT_DIR"
 }
 
@@ -132,7 +145,11 @@ run_cert() {
     fi
 
     echo ""
-    docker compose down --volumes --remove-orphans 2>/dev/null || true
+    if $KEEP; then
+        info "Containers left running (--keep). Use ./remove-all.sh or 'docker compose down' to clean up."
+    else
+        docker compose down --volumes --remove-orphans 2>/dev/null || true
+    fi
     cd "$SCRIPT_DIR"
 }
 
@@ -166,6 +183,9 @@ case "$FILTER" in
     scanner)
         run_scenario "Scanner Excess" "$SCRIPT_DIR/scanner-excess"
         ;;
+    license)
+        run_scenario "License Expiry" "$SCRIPT_DIR/license-expiry"
+        ;;
     all)
         run_cert expiring
         run_scenario "KMS Unavailability"         "$SCRIPT_DIR/kms-unavailability"
@@ -173,9 +193,10 @@ case "$FILTER" in
         run_mismatch
         run_scenario "Erasure Set Health"         "$SCRIPT_DIR/erasure-set-health"
         run_scenario "Scanner Excess"             "$SCRIPT_DIR/scanner-excess"
+        run_scenario "License Expiry"             "$SCRIPT_DIR/license-expiry"
         ;;
     *)
-        echo "Usage: $0 [cert|kms|storage|mismatch|erasure|scanner|all]"
+        echo "Usage: $0 [cert|kms|storage|mismatch|erasure|scanner|license|all] [--keep]"
         exit 1
         ;;
 esac
